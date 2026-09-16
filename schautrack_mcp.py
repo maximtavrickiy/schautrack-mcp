@@ -14,17 +14,28 @@ log_food. Сервер сам находит продукт в сохранён�
   "Яйцо (1шт=55г)"         — значения на 1 шт, можно в штуках или граммах
   "Протеиновый батончик (1шт)" — значения на 1 шт, только в штуках
   "Шаурма"                 — без суффикса: значения на порцию, только в порциях
+
+Авторизация:
+  stdio — токен Schautrack из SCHAUTRACK_TOKEN.
+  http  — каждый клиент передаёт свой токен Schautrack в заголовке
+          `Authorization: Bearer stk_...`, поэтому один сервер обслуживает
+          нескольких пользователей, и каждый видит только свои данные.
+          Если задан MCP_AUTH_TOKEN, включается однопользовательский режим:
+          клиент передаёт MCP_AUTH_TOKEN, а в Schautrack идёт SCHAUTRACK_TOKEN.
 """
 
 from __future__ import annotations
 
+import contextvars
 import datetime as dt
+import hashlib
 import hmac
 import json
 import logging
 import os
 import re
 import sys
+import time
 import uuid
 from dataclasses import dataclass
 from typing import Any, Literal
@@ -33,10 +44,12 @@ import httpx
 from pydantic import BaseModel, Field
 
 from mcp.server import MCPServer
+from mcp.server.mcpserver import Context
 from mcp.server.mcpserver.exceptions import ToolError
 
 SCHAUTRACK_URL = os.environ.get("SCHAUTRACK_URL", "http://localhost:8080").rstrip("/")
 SCHAUTRACK_TOKEN = os.environ.get("SCHAUTRACK_TOKEN", "")
+MCP_AUTH_TOKEN = os.environ.get("MCP_AUTH_TOKEN", "")
 HTTP_TIMEOUT = float(os.environ.get("SCHAUTRACK_TIMEOUT", "15"))
 # Schautrack хранит КБЖУ целыми числами; точные значения с этикетки держим рядом.
 PRECISE_FILE = os.environ.get(
@@ -59,20 +72,48 @@ class SchautrackError(ToolError):
 
 
 _client: httpx.AsyncClient | None = None
+# Токен Schautrack текущего вызова инструмента (выставляется в use_auth).
+_token: contextvars.ContextVar[str] = contextvars.ContextVar("schautrack_token", default="")
 
 
 def client() -> httpx.AsyncClient:
     global _client
-    if not SCHAUTRACK_TOKEN:
-        raise SchautrackError("Не задан SCHAUTRACK_TOKEN (Settings → Account → API tokens в Schautrack).")
     if _client is None:
         _client = httpx.AsyncClient(
             base_url=f"{SCHAUTRACK_URL}/api/v1",
-            headers={"Authorization": f"Bearer {SCHAUTRACK_TOKEN}"},
             timeout=HTTP_TIMEOUT,
             transport=httpx.AsyncHTTPTransport(retries=2),
         )
     return _client
+
+
+def bearer_from_headers(headers: Any) -> str:
+    if not headers:
+        return ""
+    value = headers.get("authorization") or headers.get("Authorization") or ""
+    scheme, _, token = value.partition(" ")
+    return token.strip() if scheme.lower() == "bearer" else ""
+
+
+# True, когда сервер запущен по HTTP и токен Schautrack приходит от клиента.
+HTTP_PASSTHROUGH = False
+
+
+def use_auth(ctx: Context) -> None:
+    """Выбирает токен Schautrack для текущего вызова инструмента."""
+    if HTTP_PASSTHROUGH:
+        try:
+            token = bearer_from_headers(ctx.headers)
+        except ValueError:
+            token = ""
+    else:
+        token = SCHAUTRACK_TOKEN
+    if not token:
+        raise SchautrackError(
+            "Нет токена Schautrack: передай заголовок `Authorization: Bearer stk_...` "
+            "(Settings → Account → API tokens) или задай SCHAUTRACK_TOKEN."
+        )
+    _token.set(token)
 
 
 def _problem_text(resp: httpx.Response) -> str:
@@ -91,7 +132,7 @@ def _problem_text(resp: httpx.Response) -> str:
 
 
 async def api(method: str, path: str, *, json: Any = None, params: dict | None = None, idempotent_post: bool = False) -> Any:
-    headers = {}
+    headers = {"Authorization": f"Bearer {_token.get()}"}
     if idempotent_post:
         # Один ключ на логическую операцию: повтор после таймаута не задвоит запись.
         headers["Idempotency-Key"] = str(uuid.uuid4())
@@ -181,20 +222,54 @@ def _tokens(s: str) -> list[str]:
     return [t.strip(".,") for t in _norm(s).split() if t.strip(".,")]
 
 
-def _read_precise() -> dict[str, dict[str, float | None]]:
+_user_ids: dict[str, tuple[int, float]] = {}
+USER_CACHE_TTL = 300.0
+
+
+def _token_key(token: str) -> str:
+    return hashlib.sha256(token.encode()).hexdigest()
+
+
+async def current_user_id() -> int:
+    key = _token_key(_token.get())
+    cached = _user_ids.get(key)
+    if cached and cached[1] > time.monotonic():
+        return cached[0]
+    me = await api("GET", "/me")
+    _user_ids[key] = (me["user"]["id"], time.monotonic() + USER_CACHE_TTL)
+    return me["user"]["id"]
+
+
+def _read_precise_file() -> dict[str, Any] | None:
+    """None — файл есть, но не читается: тогда его нельзя перезаписывать."""
     try:
         with open(PRECISE_FILE, encoding="utf-8") as fh:
-            return json.load(fh)
+            data = json.load(fh)
     except FileNotFoundError:
-        return {}
+        return {"users": {}}
     except (OSError, ValueError) as exc:
         logging.warning("Не удалось прочитать %s: %s", PRECISE_FILE, exc)
-        return {}
+        return None
+    if "users" not in data:
+        # Старый формат без разделения по пользователям: id продуктов в Schautrack
+        # глобально уникальны, поэтому записи можно оставить общими.
+        data = {"users": {}, "legacy": data}
+    return data
 
 
-def save_precise(food_id: int, values: dict[str, float | None]) -> None:
-    data = _read_precise()
-    data[str(food_id)] = values
+async def read_precise() -> dict[str, dict[str, float | None]]:
+    uid = str(await current_user_id())
+    data = _read_precise_file() or {"users": {}}
+    return {**data.get("legacy", {}), **data["users"].get(uid, {})}
+
+
+async def save_precise(food_id: int, values: dict[str, float | None]) -> None:
+    uid = str(await current_user_id())
+    data = _read_precise_file()
+    if data is None:
+        return
+    data["users"].setdefault(uid, {})[str(food_id)] = values
+    data.get("legacy", {}).pop(str(food_id), None)
     try:
         os.makedirs(os.path.dirname(PRECISE_FILE), exist_ok=True)
         tmp = PRECISE_FILE + ".tmp"
@@ -225,7 +300,7 @@ def _apply_precise(food: Food, precise: dict[str, dict[str, float | None]]) -> F
 
 async def load_foods() -> list[Food]:
     data = await api("GET", "/saved-foods")
-    precise = _read_precise()
+    precise = await read_precise()
     return [_apply_precise(parse_food(f), precise) for f in data["data"]]
 
 
@@ -392,6 +467,7 @@ def _entry_row(e: dict[str, Any]) -> dict[str, Any]:
 
 @mcp.tool()
 async def log_food(
+    ctx: Context,
     items: list[MealItem],
     date: str | None = None,
     meal: str | None = None,
@@ -409,6 +485,7 @@ async def log_food(
         meal: необязательная метка приёма пищи ("Завтрак", "Обед"), попадёт в название записи.
         dry_run: true — только посчитать и показать, ничего не записывать.
     """
+    use_auth(ctx)
     if not items:
         raise SchautrackError("Список items пуст.")
     foods = await load_foods()
@@ -455,6 +532,7 @@ async def log_food(
 
 @mcp.tool()
 async def log_custom_entry(
+    ctx: Context,
     name: str,
     calories: float | None = None,
     protein_g: float | None = None,
@@ -473,6 +551,7 @@ async def log_custom_entry(
         calories, protein_g, fat_g, carbs_g, fiber_g, sugar_g: значения на всю порцию.
         date: YYYY-MM-DD, "today"/"yesterday" или "-1". По умолчанию сегодня.
     """
+    use_auth(ctx)
     vals = {"calories": calories, "protein_g": protein_g, "fat_g": fat_g, "carbs_g": carbs_g, "fiber_g": fiber_g, "sugar_g": sugar_g}
     body: dict[str, Any] = {k: _round(v) for k, v in vals.items() if v is not None}
     if not body:
@@ -486,7 +565,7 @@ async def log_custom_entry(
 
 
 @mcp.tool()
-async def day_summary(date: str | None = None) -> dict[str, Any]:
+async def day_summary(ctx: Context, date: str | None = None) -> dict[str, Any]:
     """Все записи о еде за день и итоги КБЖУ (посчитаны сервером), плюс дневная цель по калориям.
 
     Используй для отчётов и заметок в Obsidian вместо собственного сложения.
@@ -494,6 +573,7 @@ async def day_summary(date: str | None = None) -> dict[str, Any]:
     Args:
         date: YYYY-MM-DD, "today"/"yesterday" или "-1". По умолчанию сегодня.
     """
+    use_auth(ctx)
     me = await api("GET", "/me")
     day = await resolve_date(date) or me["server"]["today"]
     entries: list[dict[str, Any]] = []
@@ -523,13 +603,14 @@ async def day_summary(date: str | None = None) -> dict[str, Any]:
 
 
 @mcp.tool()
-async def period_summary(date_from: str, date_to: str) -> dict[str, Any]:
+async def period_summary(ctx: Context, date_from: str, date_to: str) -> dict[str, Any]:
     """Итоги КБЖУ по дням за период и средние значения (для недельных/месячных отчётов).
 
     Args:
         date_from: начало периода (YYYY-MM-DD или смещение, например "-6").
         date_to: конец периода включительно (YYYY-MM-DD, "today").
     """
+    use_auth(ctx)
     start = await resolve_date(date_from) or (await server_today()).isoformat()
     end = await resolve_date(date_to) or (await server_today()).isoformat()
     if start > end:
@@ -556,20 +637,22 @@ async def period_summary(date_from: str, date_to: str) -> dict[str, Any]:
 
 
 @mcp.tool()
-async def delete_entry(entry_id: int) -> dict[str, Any]:
+async def delete_entry(ctx: Context, entry_id: int) -> dict[str, Any]:
     """Удалить запись о еде по id (id берутся из log_food или day_summary). Для исправления: удалить и записать заново."""
+    use_auth(ctx)
     entry = await api("GET", f"/entries/{entry_id}")
     await api("DELETE", f"/entries/{entry_id}")
     return {"deleted": True, "entry": _entry_row(entry)}
 
 
 @mcp.tool()
-async def find_food(query: str = "") -> dict[str, Any]:
+async def find_food(ctx: Context, query: str = "") -> dict[str, Any]:
     """Найти сохранённые продукты и их КБЖУ (на 100 г / 100 мл / 1 шт / порцию). Пустой query — весь список.
 
     Args:
         query: часть названия, например "творог".
     """
+    use_auth(ctx)
     foods = await load_foods()
     found = match_food(foods, query) if query.strip() else foods
     return {"count": len(found), "foods": [f.describe() for f in found]}
@@ -610,6 +693,7 @@ def _food_raw_name(name: str, per: str, piece_grams: float | None) -> str:
 
 @mcp.tool()
 async def add_food(
+    ctx: Context,
     name: str,
     per: Literal["100g", "100ml", "piece", "portion"],
     calories: float,
@@ -631,18 +715,20 @@ async def add_food(
         piece_grams: вес одной штуки в граммах (для per="piece", позволяет логировать и в граммах).
         emoji: необязательный эмодзи для приложения.
     """
+    use_auth(ctx)
     vals = _food_vals(calories, protein_g, fat_g, carbs_g, fiber_g, sugar_g)
     body: dict[str, Any] = {k: _round(v) for k, v in vals.items()}
     body["name"] = _food_raw_name(name, per, piece_grams)
     if emoji:
         body["emoji"] = emoji
     created = await api("POST", "/saved-foods", json=body, idempotent_post=True)
-    save_precise(created["id"], {k: vals.get(k) for k in ("calories", *MACROS)})
-    return {"added": True, "food": _apply_precise(parse_food(created), _read_precise()).describe()}
+    await save_precise(created["id"], {k: vals.get(k) for k in ("calories", *MACROS)})
+    return {"added": True, "food": _apply_precise(parse_food(created), await read_precise()).describe()}
 
 
 @mcp.tool()
 async def update_food(
+    ctx: Context,
     food: str,
     calories: float | None = None,
     protein_g: float | None = None,
@@ -661,6 +747,7 @@ async def update_food(
         new_name, per, piece_grams: изменить название / единицу / вес штуки.
         остальные: новые значения на единицу продукта.
     """
+    use_auth(ctx)
     foods = await load_foods()
     f = resolve_food(foods, food)
     vals = _food_vals(calories, protein_g, fat_g, carbs_g, fiber_g, sugar_g)
@@ -675,16 +762,17 @@ async def update_food(
         raise SchautrackError("Нечего менять.")
     updated = await api("PATCH", f"/saved-foods/{f.id}", json=body)
     # f уже с точными значениями (если они были актуальны) — накладываем новые поверх.
-    save_precise(f.id, {**{"calories": f.calories, **f.macros}, **vals})
-    return {"updated": True, "food": _apply_precise(parse_food(updated), _read_precise()).describe()}
+    await save_precise(f.id, {**{"calories": f.calories, **f.macros}, **vals})
+    return {"updated": True, "food": _apply_precise(parse_food(updated), await read_precise()).describe()}
 
 
 @mcp.tool()
-async def lookup_barcode(code: str) -> dict[str, Any]:
+async def lookup_barcode(ctx: Context, code: str) -> dict[str, Any]:
     """Найти продукт по штрихкоду (EAN-8/13, UPC) в Open Food Facts. Значения на 100 г.
 
     Покажи результат пользователю; если всё верно — сохрани через add_food(per="100g").
     """
+    use_auth(ctx)
     code = re.sub(r"\D", "", code)
     try:
         data = await api("GET", f"/barcode/{code}")
@@ -713,7 +801,7 @@ async def lookup_barcode(code: str) -> dict[str, Any]:
 
 
 @mcp.tool()
-async def log_weight(weight: float, date: str | None = None, body_fat_percent: float | None = None) -> dict[str, Any]:
+async def log_weight(ctx: Context, weight: float, date: str | None = None, body_fat_percent: float | None = None) -> dict[str, Any]:
     """Записать вес (в единицах аккаунта, обычно кг) и, по желанию, % жира. Повторная запись за день заменяет прежнюю.
 
     Args:
@@ -721,6 +809,7 @@ async def log_weight(weight: float, date: str | None = None, body_fat_percent: f
         date: YYYY-MM-DD, "today"/"yesterday" или "-1". По умолчанию сегодня.
         body_fat_percent: процент жира, если пользователь его назвал.
     """
+    use_auth(ctx)
     day = await resolve_date(date) or (await server_today()).isoformat()
     body: dict[str, Any] = {"weight": weight}
     if body_fat_percent is not None:
@@ -734,9 +823,37 @@ async def log_weight(weight: float, date: str | None = None, body_fat_percent: f
 # ---------------------------------------------------------------------------
 
 
+_token_checks: dict[str, tuple[bool, float]] = {}
+
+
+async def check_schautrack_token(token: str) -> bool | None:
+    """True/False — токен принят/отклонён Schautrack; None — Schautrack недоступен."""
+    key = _token_key(token)
+    if len(_token_checks) > 1000:
+        _token_checks.clear()
+    cached = _token_checks.get(key)
+    if cached and cached[1] > time.monotonic():
+        return cached[0]
+    try:
+        resp = await client().get("/me", headers={"Authorization": f"Bearer {token}"})
+    except httpx.HTTPError:
+        return None
+    if resp.status_code >= 500:
+        return None
+    ok = resp.status_code == 200
+    if ok:
+        _user_ids[key] = (resp.json()["user"]["id"], time.monotonic() + USER_CACHE_TTL)
+    # Отказ кэшируем ненадолго, чтобы перебор токенов не долбил Schautrack.
+    _token_checks[key] = (ok, time.monotonic() + (USER_CACHE_TTL if ok else 30.0))
+    return ok
+
+
 def main() -> None:
+    global HTTP_PASSTHROUGH
     transport = os.environ.get("MCP_TRANSPORT", "stdio").lower()
     if transport == "stdio":
+        if not SCHAUTRACK_TOKEN:
+            sys.exit("Для stdio задайте SCHAUTRACK_TOKEN.")
         mcp.run()
         return
     if transport not in ("http", "streamable-http"):
@@ -748,9 +865,14 @@ def main() -> None:
 
     host = os.environ.get("MCP_HOST", "0.0.0.0")
     port = int(os.environ.get("MCP_PORT", "8000"))
-    auth_token = os.environ.get("MCP_AUTH_TOKEN", "")
-    if not auth_token and host not in ("127.0.0.1", "localhost", "::1"):
-        sys.exit("MCP_AUTH_TOKEN обязателен, если сервер слушает не только localhost.")
+    if MCP_AUTH_TOKEN:
+        if not SCHAUTRACK_TOKEN:
+            sys.exit("MCP_AUTH_TOKEN задан (однопользовательский режим), но нет SCHAUTRACK_TOKEN.")
+        logging.warning("Однопользовательский режим: все клиенты пишут в аккаунт SCHAUTRACK_TOKEN.")
+    else:
+        HTTP_PASSTHROUGH = True
+        if SCHAUTRACK_TOKEN:
+            logging.warning("SCHAUTRACK_TOKEN игнорируется: в HTTP-режиме токен передаёт каждый клиент.")
 
     app = mcp.streamable_http_app(
         host=host,
@@ -759,12 +881,21 @@ def main() -> None:
     )
 
     async def guarded(scope, receive, send):
-        if scope["type"] == "http" and auth_token:
-            headers = dict(scope.get("headers") or [])
-            given = headers.get(b"authorization", b"").decode()
-            if not hmac.compare_digest(given.encode(), f"Bearer {auth_token}".encode()):
-                await JSONResponse({"error": "unauthorized"}, status_code=401)(scope, receive, send)
+        if scope["type"] != "http":
+            await app(scope, receive, send)
+            return
+        headers = {k.decode("latin-1"): v.decode("latin-1") for k, v in scope.get("headers") or []}
+        given = bearer_from_headers(headers)
+        if HTTP_PASSTHROUGH:
+            ok = await check_schautrack_token(given) if given.startswith("stk_") else False
+            if ok is None:
+                await JSONResponse({"error": "schautrack unavailable"}, status_code=503)(scope, receive, send)
                 return
+        else:
+            ok = hmac.compare_digest(given.encode(), MCP_AUTH_TOKEN.encode())
+        if not ok:
+            await JSONResponse({"error": "unauthorized"}, status_code=401)(scope, receive, send)
+            return
         await app(scope, receive, send)
 
     uvicorn.run(guarded, host=host, port=port, log_level="info")
