@@ -1,0 +1,27 @@
+# Запускать рядом с Schautrack. SCHAUTRACK_URL — адрес Schautrack изнутри этого контейнера.
+name: schautrack-mcp
+
+services:
+  schautrack-mcp:
+    image: ghcr.io/maximtavrickiy/schautrack-mcp:latest
+    # Собрать локально вместо готового образа:
+    # build: .
+    env_file: .env
+    ports:
+      # Только localhost: picoclaw на том же хосте ходит на http://127.0.0.1:8765/mcp.
+      # Если picoclaw в docker — подключите оба контейнера к одной сети и уберите ports.
+      - "127.0.0.1:8765:8000"
+    volumes:
+      - mcp-data:/data
+    restart: unless-stopped
+    # Чтобы ходить в Schautrack по имени контейнера (http://web:3000),
+    # подключите сервис к сети Schautrack:
+    # networks: [schautrack]
+
+volumes:
+  mcp-data:
+
+# networks:
+#   schautrack:
+#     external: true
+#     name: schautrack_app-network
