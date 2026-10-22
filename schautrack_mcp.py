@@ -270,6 +270,21 @@ async def save_precise(food_id: int, values: dict[str, float | None]) -> None:
         return
     data["users"].setdefault(uid, {})[str(food_id)] = values
     data.get("legacy", {}).pop(str(food_id), None)
+    _write_precise(data)
+
+
+async def drop_precise(food_id: int) -> None:
+    uid = str(await current_user_id())
+    data = _read_precise_file()
+    if data is None:
+        return
+    removed = data["users"].get(uid, {}).pop(str(food_id), None)
+    removed_legacy = data.get("legacy", {}).pop(str(food_id), None)
+    if removed is not None or removed_legacy is not None:
+        _write_precise(data)
+
+
+def _write_precise(data: dict[str, Any]) -> None:
     try:
         os.makedirs(os.path.dirname(PRECISE_FILE), exist_ok=True)
         tmp = PRECISE_FILE + ".tmp"
@@ -325,15 +340,19 @@ def match_food(foods: list[Food], query: str) -> list[Food]:
     return out
 
 
-def resolve_food(foods: list[Food], query: str) -> Food:
+NOT_FOUND_HINT = (
+    "Не спрашивай пользователя и не создавай продукт: найди КБЖУ в интернете (этикетка/сайт производителя, "
+    "если назван бренд, иначе USDA/Скурихин) и запиши через log_custom_entry(per=\"100g\", grams=..., approximate=true). "
+    "Остальные продукты из этого списка запиши через log_food без него."
+)
+
+
+def resolve_food(foods: list[Food], query: str, not_found_hint: str = "") -> Food:
     found = match_food(foods, query)
     if len(found) == 1:
         return found[0]
     if not found:
-        raise SchautrackError(
-            f"Продукт «{query}» не найден в сохранённых продуктах. Не выдумывай значения: "
-            "спроси у пользователя КБЖУ с этикетки (или штрихкод → lookup_barcode) и добавь через add_food."
-        )
+        raise SchautrackError(f"Продукт «{query}» не найден в сохранённых продуктах. {not_found_hint}".strip())
     names = ", ".join(f"«{f.name}» (id {f.id})" for f in found[:10])
     raise SchautrackError(f"«{query}» подходит под несколько продуктов: {names}. Уточни у пользователя или передай id.")
 
@@ -389,9 +408,10 @@ async def resolve_date(value: str | None) -> str | None:
 mcp = MCPServer(
     name="schautrack",
     instructions=(
-        "Учёт питания, КБЖУ и веса в Schautrack. НИКОГДА не считай калории и БЖУ сам и не бери их из памяти: "
-        "для съеденного вызывай log_food (продукт + граммы/штуки) — сервер сам пересчитает значения. "
-        "Если продукта нет — спроси у пользователя значения с этикетки и добавь через add_food. "
+        "Учёт питания, КБЖУ и веса в Schautrack. Не пересчитывай КБЖУ на вес сам — это делает сервер. "
+        "Источники значений по приоритету: цифры пользователя → сохранённый продукт (log_food) → интернет. "
+        "Цифры пользователя и найденные в интернете записывай через log_custom_entry (значения на 100 г + граммы). "
+        "Продукты в базу (add_food) добавляй только по явной просьбе пользователя. "
         "Итоги за день бери из day_summary, а не складывай сам."
     ),
 )
@@ -445,8 +465,10 @@ def _totals(rows: list[dict[str, Any]]) -> dict[str, int]:
 
 def _table(rows: list[dict[str, Any]], totals: dict[str, int], first_col: str = "Продукт") -> str:
     head = f"| {first_col} | Ккал | Б | Ж | У |\n|---|---:|---:|---:|---:|\n"
+    # Незаполненное значение показываем прочерком, а не нулём, чтобы пропуск был виден.
+    cell = lambda v: "—" if v is None else v  # noqa: E731
     body = "".join(
-        f"| {r['label']} | {r.get('calories') or 0} | {r.get('protein_g') or 0} | {r.get('fat_g') or 0} | {r.get('carbs_g') or 0} |\n"
+        f"| {r['label']} | {cell(r.get('calories'))} | {cell(r.get('protein_g'))} | {cell(r.get('fat_g'))} | {cell(r.get('carbs_g'))} |\n"
         for r in rows
     )
     foot = f"| **Итого** | **{totals['calories']}** | **{totals['protein_g']}** | **{totals['fat_g']}** | **{totals['carbs_g']}** |"
@@ -465,6 +487,34 @@ def _entry_row(e: dict[str, Any]) -> dict[str, Any]:
     }
 
 
+def _stored_mismatch(sent: dict[str, Any], row: dict[str, Any]) -> list[str]:
+    """Сверка отправленного с тем, что сервер реально сохранил (ккал не сверяем: auto_calc_calories может их пересчитать)."""
+    out = []
+    for k in MACROS:
+        if k in sent and row.get(k) != sent[k]:
+            out.append(f"{k}: отправлено {sent[k]}, сохранено {row.get(k)}")
+    return out
+
+
+KCAL_TOLERANCE = 0.15
+KCAL_TOLERANCE_ABS = 15
+
+
+def _kcal_from_macros(protein: float, fat: float, carbs: float) -> float:
+    return 4 * protein + 9 * fat + 4 * carbs
+
+
+def _kcal_warning(calories: float, protein: float, fat: float, carbs: float) -> str | None:
+    expected = _kcal_from_macros(protein, fat, carbs)
+    diff = abs(calories - expected)
+    if diff > KCAL_TOLERANCE_ABS and diff > KCAL_TOLERANCE * max(calories, expected):
+        return (
+            f"Калории ({_fmt_num(round(calories, 1))}) не сходятся с БЖУ (4·Б+9·Ж+4·У = {_fmt_num(round(expected, 1))}). "
+            "Проверь значения; если ошибка — delete_entry и запиши заново."
+        )
+    return None
+
+
 @mcp.tool()
 async def log_food(
     ctx: Context,
@@ -475,9 +525,9 @@ async def log_food(
 ) -> dict[str, Any]:
     """Записать съеденное: сервер сам находит продукты и пересчитывает КБЖУ на указанный вес.
 
-    Главный инструмент для учёта еды. Передай список продуктов с граммами или штуками —
-    ничего не считай сам. Если хоть один продукт не найден или неоднозначен, ничего не
-    записывается и возвращается ошибка с подсказкой.
+    Для продуктов из базы. Если пользователь сам назвал КБЖУ — используй log_custom_entry.
+    Передай список продуктов с граммами или штуками — ничего не считай сам. Если хоть один
+    продукт не найден или неоднозначен, ничего не записывается и возвращается ошибка с подсказкой.
 
     Args:
         items: продукты и количество, например [{"food": "гречка", "grams": 150}, {"food": "яйцо", "pieces": 2}]
@@ -491,7 +541,7 @@ async def log_food(
     foods = await load_foods()
     planned = []
     for item in items:
-        food = resolve_food(foods, item.food)
+        food = resolve_food(foods, item.food, NOT_FOUND_HINT)
         k, qty = _scale(food, item)
         vals = _values(food, k)
         if all(v is None for v in vals.values()):
@@ -507,7 +557,7 @@ async def log_food(
         totals = _totals(rows)
         return {"dry_run": True, "date": day or "today", "items": rows, "totals": totals, "table": _table(rows, totals)}
 
-    created, rows = [], []
+    created, rows, mismatches = [], [], []
     for p in planned:
         body: dict[str, Any] = {"name": p["name"], **{k: v for k, v in p["vals"].items() if v is not None}}
         if day:
@@ -519,49 +569,94 @@ async def log_food(
             raise SchautrackError(f"{exc}. Уже записано до ошибки: {done}. Остальное НЕ записано.") from exc
         created.append(entry)
         # В таблицу — то, что реально сохранил сервер (при auto_calc_calories он пересчитывает ккал из БЖУ).
-        rows.append({**_entry_row(entry), "label": p["label"]})
+        row = {**_entry_row(entry), "label": p["label"]}
+        rows.append(row)
+        mismatches += [f"«{p['label']}» {m}" for m in _stored_mismatch(body, row)]
     totals = _totals(rows)
-    return {
+    out = {
         "logged": True,
         "date": created[0]["date"],
         "entries": rows,
         "totals": totals,
         "table": _table(rows, totals),
     }
+    if mismatches:
+        out["stored_mismatch"] = mismatches
+    return out
 
 
 @mcp.tool()
 async def log_custom_entry(
     ctx: Context,
     name: str,
-    calories: float | None = None,
-    protein_g: float | None = None,
-    fat_g: float | None = None,
-    carbs_g: float | None = None,
-    fiber_g: float | None = None,
-    sugar_g: float | None = None,
+    protein_g: float = Field(ge=0),
+    fat_g: float = Field(ge=0),
+    carbs_g: float = Field(ge=0),
+    per: Literal["100g", "piece", "portion"] = "100g",
+    grams: float | None = Field(default=None, gt=0),
+    pieces: float | None = Field(default=None, gt=0),
+    piece_grams: float | None = Field(default=None, gt=0),
+    calories: float | None = Field(default=None, ge=0),
+    approximate: bool = False,
+    meal: str | None = None,
     date: str | None = None,
 ) -> dict[str, Any]:
-    """Записать еду с уже известными ИТОГОВЫМИ значениями на всю порцию (например, пользователь сам назвал КБЖУ блюда из меню).
+    """Записать съеденное по известным КБЖУ, без сохранения продукта в базу. Сервер сам пересчитает на вес.
 
-    Не используй для продуктов из базы — для них log_food. Не придумывай значения: только те, что дал пользователь.
+    Для цифр, которые назвал пользователь, и для значений, найденных в интернете или по штрихкоду.
+    Б, Ж и У обязательны: если в продукте чего-то нет — передай 0 явно.
 
     Args:
-        name: что съедено, например "Бизнес-ланч в кафе".
-        calories, protein_g, fat_g, carbs_g, fiber_g, sugar_g: значения на всю порцию.
+        name: что съедено, например "Йогурт" или "Белок яйца С0". Без веса — его добавит сервер.
+        protein_g, fat_g, carbs_g: значения на `per`, как в источнике (дроби можно: 0.1).
+        per: на что указаны значения: "100g" (по умолчанию; для жидкостей — 100 мл), "piece" (1 шт), "portion" (вся порция).
+        grams: сколько съедено, г/мл — для per="100g".
+        pieces: сколько штук — для per="piece", либо для per="100g" вместе с piece_grams.
+        piece_grams: вес одной штуки в граммах (для per="100g" + pieces).
+        calories: ккал на `per`. Не указано — сервер посчитает как 4·Б + 9·Ж + 4·У.
+        approximate: true — значения из интернета (не от пользователя и не с этикетки); к названию добавится «~».
+        meal: необязательная метка приёма пищи ("Завтрак", "Обед").
         date: YYYY-MM-DD, "today"/"yesterday" или "-1". По умолчанию сегодня.
     """
     use_auth(ctx)
-    vals = {"calories": calories, "protein_g": protein_g, "fat_g": fat_g, "carbs_g": carbs_g, "fiber_g": fiber_g, "sugar_g": sugar_g}
-    body: dict[str, Any] = {k: _round(v) for k, v in vals.items() if v is not None}
-    if not body:
-        raise SchautrackError("Нужны калории или хотя бы один макронутриент.")
-    body["name"] = _trim_bytes(name, ENTRY_NAME_MAX_BYTES)
+    if per == "100g":
+        if grams is not None and pieces is None:
+            k, qty = grams / 100.0, f"{_fmt_num(grams)} г"
+        elif grams is None and pieces is not None and piece_grams:
+            k = pieces * piece_grams / 100.0
+            qty = f"{_fmt_num(pieces)} шт (~{_fmt_num(round(pieces * piece_grams))} г)"
+        else:
+            raise SchautrackError('Для per="100g" передай grams либо pieces вместе с piece_grams.')
+    elif per == "piece":
+        if pieces is None or grams is not None:
+            raise SchautrackError('Для per="piece" передай pieces (без grams).')
+        k, qty = pieces, f"{_fmt_num(pieces)} шт"
+    else:
+        if grams is not None or pieces is not None:
+            raise SchautrackError('per="portion" — значения уже на всю порцию, не передавай grams/pieces.')
+        k, qty = 1.0, ""
+
+    warning = _kcal_warning(calories, protein_g, fat_g, carbs_g) if calories is not None else None
+    kcal = calories if calories is not None else _kcal_from_macros(protein_g, fat_g, carbs_g)
+    body: dict[str, Any] = {
+        "calories": _round(kcal * k),
+        "protein_g": _round(protein_g * k),
+        "fat_g": _round(fat_g * k),
+        "carbs_g": _round(carbs_g * k),
+    }
+    label = f"{name.strip()} {qty}".strip() + (" ~" if approximate else "")
+    body["name"] = _trim_bytes(f"{meal}: {label}" if meal else label, ENTRY_NAME_MAX_BYTES)
     day = await resolve_date(date)
     if day:
         body["date"] = day
     entry = await api("POST", "/entries", json=body, idempotent_post=True)
-    return {"logged": True, "entry": _entry_row(entry)}
+    row = {**_entry_row(entry), "label": label}
+    out: dict[str, Any] = {"logged": True, "entry": row, "table": _table([row], _totals([row]))}
+    if warning:
+        out["warning"] = warning
+    if mismatch := _stored_mismatch(body, row):
+        out["stored_mismatch"] = mismatch
+    return out
 
 
 @mcp.tool()
@@ -705,7 +800,10 @@ async def add_food(
     piece_grams: float | None = None,
     emoji: str | None = None,
 ) -> dict[str, Any]:
-    """Добавить продукт в базу. Значения — ТОЛЬКО от пользователя (этикетка) или из lookup_barcode, не из памяти.
+    """Сохранить продукт в базу — ТОЛЬКО по явной просьбе пользователя («добавь в базу», «сохрани продукт»).
+
+    Для записи съеденного продукт не нужен: используй log_custom_entry. Значения — от пользователя,
+    с этикетки или из lookup_barcode.
 
     Args:
         name: название без единиц, например "Творог 5% Простоквашино".
@@ -767,10 +865,27 @@ async def update_food(
 
 
 @mcp.tool()
+async def delete_food(ctx: Context, food: str) -> dict[str, Any]:
+    """Удалить сохранённый продукт из базы — ТОЛЬКО по явной просьбе пользователя, после того как показал ему продукт.
+
+    Записи о съеденном не затрагиваются: они хранят свои КБЖУ отдельно.
+
+    Args:
+        food: название или id продукта ("#12").
+    """
+    use_auth(ctx)
+    f = resolve_food(await load_foods(), food)
+    await api("DELETE", f"/saved-foods/{f.id}")
+    await drop_precise(f.id)
+    return {"deleted": True, "food": f.describe()}
+
+
+@mcp.tool()
 async def lookup_barcode(ctx: Context, code: str) -> dict[str, Any]:
     """Найти продукт по штрихкоду (EAN-8/13, UPC) в Open Food Facts. Значения на 100 г.
 
-    Покажи результат пользователю; если всё верно — сохрани через add_food(per="100g").
+    Чтобы записать съеденное — передай per_100g в log_custom_entry(per="100g", grams=...).
+    В базу (add_food) сохраняй только по явной просьбе пользователя.
     """
     use_auth(ctx)
     code = re.sub(r"\D", "", code)
@@ -779,7 +894,7 @@ async def lookup_barcode(ctx: Context, code: str) -> dict[str, Any]:
     except SchautrackError as exc:
         raise SchautrackError(
             f"Штрихкод {code} не найден в Open Food Facts или база недоступна ({exc}). "
-            "Попроси пользователя прислать КБЖУ с этикетки и добавь через add_food."
+            "Найди КБЖУ продукта в интернете и запиши через log_custom_entry(approximate=true)."
         ) from exc
     m = data.get("macrosPer100g") or {}
     per100 = {
